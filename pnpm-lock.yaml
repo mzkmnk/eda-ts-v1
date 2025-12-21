@@ -38,12 +38,6 @@ importers:
       '@middy/core':
         specifier: ^6.4.5
         version: 6.4.5
-      aws-cdk-lib:
-        specifier: 2.215.0
-        version: 2.215.0(constructs@10.4.4)
-      constructs:
-        specifier: ^10.0.0
-        version: 10.4.4
       zod:
         specifier: ^4.2.1
         version: 4.2.1
@@ -60,6 +54,15 @@ importers:
       aws-cdk:
         specifier: ^2.1100.1
         version: 2.1100.1
+      aws-cdk-lib:
+        specifier: ^2.233.0
+        version: 2.233.0(constructs@10.4.4)
+      aws-cdk-local:
+        specifier: ^3.0.1
+        version: 3.0.1
+      constructs:
+        specifier: ^10.4.4
+        version: 10.4.4
       esbuild:
         specifier: ^0.27.2
         version: 0.27.2
@@ -1033,8 +1036,8 @@ packages:
   atomic-batcher@1.0.2:
     resolution: {integrity: sha512-EFGCRj4kLX1dHv1cDzTk+xbjBFj1GnJDpui52YmEcxxHHEWjYyT6l51U7n6WQ28osZH4S9gSybxe56Vm7vB61Q==}
 
-  aws-cdk-lib@2.215.0:
-    resolution: {integrity: sha512-DvRiUEsZSc4voeqfkYGrjP0f4NJ1u94JvbVCUQ+Fci4rf25xLRSEVPzyaH9Tf7V38i0Otts1+u7seunqe+R19g==}
+  aws-cdk-lib@2.233.0:
+    resolution: {integrity: sha512-rBOzIA8TGC5eB8TyVIvckAVlX7a0/gVPE634FguhSee9RFaovjgc5+IixGyyLJhu3lLsMSjqDoqTJg2ab+p8ng==}
     engines: {node: '>= 18.0.0'}
     peerDependencies:
       constructs: ^10.0.0
@@ -1050,6 +1053,10 @@ packages:
       - table
       - yaml
       - mime-types
+
+  aws-cdk-local@3.0.1:
+    resolution: {integrity: sha512-m5Mre/nbMjwA+9zY4rc5DXzscDDgH2Y9J4/QZ95EFi++IlGHNLXnx7h/16uQoq4sWd3Z/JPjQcLf+p1aulbkpQ==}
+    hasBin: true
 
   aws-cdk@2.1100.1:
     resolution: {integrity: sha512-q2poFrQh90TK6eqeI0zznA8r1JkDI63WVOSqC7gFGo6qjQjAnvFk/utxHoNRgAC0RL0CLd19uCcHh3jfX9NiSg==}
@@ -1221,6 +1228,10 @@ packages:
 
   diff@4.0.2:
     resolution: {integrity: sha512-58lmxKSA4BNyLz+HHMUzlOEpg09FV+ev6ZMe3vJihgdxzgcwZ8VoEEPmALCZG9LmqfVoNMMKpttIYTVG6uDY7A==}
+    engines: {node: '>=0.3.1'}
+
+  diff@5.2.0:
+    resolution: {integrity: sha512-uIFDxqpRZGZ6ThOk84hEfqWoHx2devRFvpTZcTHur85vImfaxUbTW9Ryh4CpCuDnToOP1CEtXKIgytHBPVff5A==}
     engines: {node: '>=0.3.1'}
 
   electron-to-chromium@1.5.267:
@@ -3464,12 +3475,16 @@ snapshots:
 
   atomic-batcher@1.0.2: {}
 
-  aws-cdk-lib@2.215.0(constructs@10.4.4):
+  aws-cdk-lib@2.233.0(constructs@10.4.4):
     dependencies:
       '@aws-cdk/asset-awscli-v1': 2.2.242
       '@aws-cdk/asset-node-proxy-agent-v6': 2.1.0
       '@aws-cdk/cloud-assembly-schema': 48.20.0
       constructs: 10.4.4
+
+  aws-cdk-local@3.0.1:
+    dependencies:
+      diff: 5.2.0
 
   aws-cdk@2.1100.1:
     optionalDependencies:
@@ -3655,6 +3670,8 @@ snapshots:
   diff-sequences@29.6.3: {}
 
   diff@4.0.2: {}
+
+  diff@5.2.0: {}
 
   electron-to-chromium@1.5.267: {}
 
