@@ -144,12 +144,33 @@ const paymentCompletedRule = new events.Rule(
 
 paymentCompletedRule.addTarget(new targets.SnsTopic(notificationTopic));
 
+// Lambda Powertools 用の共通環境変数
+const emailNotifierEnv = {
+  POWERTOOLS_SERVICE_NAME: "email-notifier",
+  POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+  LOG_LEVEL: "INFO",
+};
+
+const smsNotifierEnv = {
+  POWERTOOLS_SERVICE_NAME: "sms-notifier",
+  POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+  LOG_LEVEL: "INFO",
+};
+
 // メール通知Lambda
 const emailNotifier = new nodejs.NodejsFunction(this, "EmailNotifier", {
   entry: path.join(__dirname, "../lambda/email-notifier/index.ts"),
   handler: "handler",
   runtime: lambda.Runtime.NODEJS_20_X,
   timeout: cdk.Duration.seconds(30),
+  memorySize: 256,
+  tracing: lambda.Tracing.ACTIVE,
+  environment: emailNotifierEnv,
+  bundling: {
+    minify: true,
+    sourceMap: true,
+    externalModules: ["@aws-sdk/*"],
+  },
 });
 
 // SMS通知Lambda
@@ -158,6 +179,14 @@ const smsNotifier = new nodejs.NodejsFunction(this, "SmsNotifier", {
   handler: "handler",
   runtime: lambda.Runtime.NODEJS_20_X,
   timeout: cdk.Duration.seconds(30),
+  memorySize: 256,
+  tracing: lambda.Tracing.ACTIVE,
+  environment: smsNotifierEnv,
+  bundling: {
+    minify: true,
+    sourceMap: true,
+    externalModules: ["@aws-sdk/*"],
+  },
 });
 
 // SNSサブスクリプション
@@ -169,29 +198,49 @@ notificationTopic.addSubscription(
 );
 ```
 
-### メール通知 Lambda
+### メール通知 Lambda（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/email-notifier/index.ts
 import { SNSEvent, SNSEventRecord } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
+import { z } from "zod";
 
-interface PaymentCompletedDetail {
-  orderId: string;
-  customerId: string;
-  amount: number;
-  transactionId: string;
-}
+const logger = new Logger({ serviceName: "email-notifier" });
+const tracer = new Tracer({ serviceName: "email-notifier" });
+const metrics = new Metrics({
+  serviceName: "email-notifier",
+  namespace: "OrderService",
+});
 
-interface EventBridgeMessage {
-  version: string;
-  id: string;
-  "detail-type": string;
-  source: string;
-  detail: PaymentCompletedDetail;
-}
+// Zod スキーマ
+const PaymentCompletedDetailSchema = z.object({
+  orderId: z.string(),
+  customerId: z.string(),
+  amount: z.number(),
+  transactionId: z.string(),
+});
 
-export const handler = async (event: SNSEvent): Promise<void> => {
-  console.log("Email Notifier received event:", JSON.stringify(event, null, 2));
+const EventBridgeMessageSchema = z.object({
+  version: z.string(),
+  id: z.string(),
+  "detail-type": z.string(),
+  source: z.string(),
+  detail: PaymentCompletedDetailSchema,
+});
+
+type PaymentCompletedDetail = z.infer<typeof PaymentCompletedDetailSchema>;
+
+const lambdaHandler = async (event: SNSEvent): Promise<void> => {
+  logger.info("Processing email notifications", {
+    recordCount: event.Records.length,
+  });
 
   for (const record of event.Records) {
     await processRecord(record);
@@ -199,55 +248,117 @@ export const handler = async (event: SNSEvent): Promise<void> => {
 };
 
 async function processRecord(record: SNSEventRecord): Promise<void> {
-  const message: EventBridgeMessage = JSON.parse(record.Sns.Message);
-  const detail = message.detail;
+  const segment = tracer.getSegment();
+  const subsegment = segment?.addNewSubsegment("processEmailNotification");
 
-  console.log(`Sending email notification for order: ${detail.orderId}`);
+  try {
+    const parseResult = EventBridgeMessageSchema.safeParse(
+      JSON.parse(record.Sns.Message)
+    );
 
-  // 実際のメール送信処理（SESなど）
-  // ここではシミュレーション
-  const emailContent = {
-    to: `customer-${detail.customerId}@example.com`,
-    subject: `注文確認: ${detail.orderId}`,
-    body: `
-      ご注文ありがとうございます。
-      
-      注文番号: ${detail.orderId}
-      お支払い金額: ¥${detail.amount.toLocaleString()}
-      取引ID: ${detail.transactionId}
-      
-      商品の発送準備が整い次第、再度ご連絡いたします。
-    `,
-  };
+    if (!parseResult.success) {
+      logger.error("Invalid message format", {
+        errors: parseResult.error.errors,
+      });
+      return;
+    }
 
-  console.log("Email content:", emailContent);
-  console.log(`Email notification sent for order: ${detail.orderId}`);
+    const detail = parseResult.data.detail;
+
+    logger.info("Sending email notification", { orderId: detail.orderId });
+    tracer.putAnnotation("orderId", detail.orderId);
+    subsegment?.addAnnotation("orderId", detail.orderId);
+
+    // 実際のメール送信処理（SESなど）
+    const emailContent = {
+      to: `customer-${detail.customerId}@example.com`,
+      subject: `注文確認: ${detail.orderId}`,
+      body: `
+        ご注文ありがとうございます。
+        
+        注文番号: ${detail.orderId}
+        お支払い金額: ¥${detail.amount.toLocaleString()}
+        取引ID: ${detail.transactionId}
+        
+        商品の発送準備が整い次第、再度ご連絡いたします。
+      `,
+    };
+
+    // メール送信をシミュレート
+    await sendEmail(emailContent);
+
+    metrics.addMetric("EmailSent", MetricUnit.Count, 1);
+
+    logger.info("Email notification sent", {
+      orderId: detail.orderId,
+      to: emailContent.to,
+    });
+  } finally {
+    subsegment?.close();
+  }
 }
+
+interface EmailContent {
+  to: string;
+  subject: string;
+  body: string;
+}
+
+async function sendEmail(content: EmailContent): Promise<void> {
+  // 実際の実装では SES を使用
+  logger.debug("Email content", { content });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
-### SMS 通知 Lambda
+### SMS 通知 Lambda（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/sms-notifier/index.ts
 import { SNSEvent, SNSEventRecord } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
+import { z } from "zod";
 
-interface PaymentCompletedDetail {
-  orderId: string;
-  customerId: string;
-  amount: number;
-  transactionId: string;
-}
+const logger = new Logger({ serviceName: "sms-notifier" });
+const tracer = new Tracer({ serviceName: "sms-notifier" });
+const metrics = new Metrics({
+  serviceName: "sms-notifier",
+  namespace: "OrderService",
+});
 
-interface EventBridgeMessage {
-  version: string;
-  id: string;
-  "detail-type": string;
-  source: string;
-  detail: PaymentCompletedDetail;
-}
+// Zod スキーマ
+const PaymentCompletedDetailSchema = z.object({
+  orderId: z.string(),
+  customerId: z.string(),
+  amount: z.number(),
+  transactionId: z.string(),
+});
 
-export const handler = async (event: SNSEvent): Promise<void> => {
-  console.log("SMS Notifier received event:", JSON.stringify(event, null, 2));
+const EventBridgeMessageSchema = z.object({
+  version: z.string(),
+  id: z.string(),
+  "detail-type": z.string(),
+  source: z.string(),
+  detail: PaymentCompletedDetailSchema,
+});
+
+type PaymentCompletedDetail = z.infer<typeof PaymentCompletedDetailSchema>;
+
+const lambdaHandler = async (event: SNSEvent): Promise<void> => {
+  logger.info("Processing SMS notifications", {
+    recordCount: event.Records.length,
+  });
 
   for (const record of event.Records) {
     await processRecord(record);
@@ -255,23 +366,64 @@ export const handler = async (event: SNSEvent): Promise<void> => {
 };
 
 async function processRecord(record: SNSEventRecord): Promise<void> {
-  const message: EventBridgeMessage = JSON.parse(record.Sns.Message);
-  const detail = message.detail;
+  const segment = tracer.getSegment();
+  const subsegment = segment?.addNewSubsegment("processSmsNotification");
 
-  console.log(`Sending SMS notification for order: ${detail.orderId}`);
+  try {
+    const parseResult = EventBridgeMessageSchema.safeParse(
+      JSON.parse(record.Sns.Message)
+    );
 
-  // 実際のSMS送信処理（SNS SMS、Twilioなど）
-  // ここではシミュレーション
-  const smsContent = {
-    phoneNumber: "+81XXXXXXXXXX", // 実際は顧客情報から取得
-    message: `【注文確認】注文番号${
-      detail.orderId
-    }のお支払い(¥${detail.amount.toLocaleString()})が完了しました。`,
-  };
+    if (!parseResult.success) {
+      logger.error("Invalid message format", {
+        errors: parseResult.error.errors,
+      });
+      return;
+    }
 
-  console.log("SMS content:", smsContent);
-  console.log(`SMS notification sent for order: ${detail.orderId}`);
+    const detail = parseResult.data.detail;
+
+    logger.info("Sending SMS notification", { orderId: detail.orderId });
+    tracer.putAnnotation("orderId", detail.orderId);
+    subsegment?.addAnnotation("orderId", detail.orderId);
+
+    // 実際のSMS送信処理（SNS SMS、Twilioなど）
+    const smsContent = {
+      phoneNumber: "+81XXXXXXXXXX", // 実際は顧客情報から取得
+      message: `【注文確認】注文番号${
+        detail.orderId
+      }のお支払い(¥${detail.amount.toLocaleString()})が完了しました。`,
+    };
+
+    // SMS送信をシミュレート
+    await sendSms(smsContent);
+
+    metrics.addMetric("SmsSent", MetricUnit.Count, 1);
+
+    logger.info("SMS notification sent", {
+      orderId: detail.orderId,
+      phoneNumber: smsContent.phoneNumber,
+    });
+  } finally {
+    subsegment?.close();
+  }
 }
+
+interface SmsContent {
+  phoneNumber: string;
+  message: string;
+}
+
+async function sendSms(content: SmsContent): Promise<void> {
+  // 実際の実装では SNS SMS や Twilio を使用
+  logger.debug("SMS content", { content });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
 ### サブスクリプションフィルタの例

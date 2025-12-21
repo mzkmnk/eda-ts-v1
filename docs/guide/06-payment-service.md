@@ -160,6 +160,13 @@ export class EdaStack extends cdk.Stack {
 
     orderCreatedRule.addTarget(new targets.SqsQueue(paymentQueue));
 
+    // Lambda Powertools 用の共通環境変数
+    const powertoolsEnv = {
+      POWERTOOLS_SERVICE_NAME: "payment-processor",
+      POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+      LOG_LEVEL: "INFO",
+    };
+
     // 決済処理Lambda
     const paymentProcessor = new nodejs.NodejsFunction(
       this,
@@ -169,8 +176,16 @@ export class EdaStack extends cdk.Stack {
         handler: "handler",
         runtime: lambda.Runtime.NODEJS_20_X,
         timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        tracing: lambda.Tracing.ACTIVE,
         environment: {
+          ...powertoolsEnv,
           EVENT_BUS_NAME: eventBus.eventBusName,
+        },
+        bundling: {
+          minify: true,
+          sourceMap: true,
+          externalModules: ["@aws-sdk/*"],
         },
       }
     );
@@ -189,78 +204,164 @@ export class EdaStack extends cdk.Stack {
 }
 ```
 
-### 決済処理 Lambda
+### 決済処理 Lambda（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/payment-processor/index.ts
 import { SQSEvent, SQSBatchResponse, SQSBatchItemFailure } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
 import {
   EventBridgeClient,
   PutEventsCommand,
 } from "@aws-sdk/client-eventbridge";
+import { z } from "zod";
 
-const eventBridgeClient = new EventBridgeClient({
-  endpoint: process.env.LOCALSTACK_HOSTNAME
-    ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
-    : undefined,
+const logger = new Logger({ serviceName: "payment-processor" });
+const tracer = new Tracer({ serviceName: "payment-processor" });
+const metrics = new Metrics({
+  serviceName: "payment-processor",
+  namespace: "OrderService",
 });
+
+const eventBridgeClient = tracer.captureAWSv3Client(
+  new EventBridgeClient({
+    endpoint: process.env.LOCALSTACK_HOSTNAME
+      ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+      : undefined,
+  })
+);
 
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "order-events";
 
-interface OrderDetail {
-  orderId: string;
-  customerId: string;
-  totalAmount: number;
+// Zod スキーマ
+const OrderDetailSchema = z.object({
+  orderId: z.string().min(1),
+  customerId: z.string().min(1),
+  totalAmount: z.number().nonnegative(),
+});
+
+const EventBridgeMessageSchema = z.object({
+  version: z.string(),
+  id: z.string(),
+  "detail-type": z.string(),
+  source: z.string(),
+  detail: OrderDetailSchema,
+});
+
+type OrderDetail = z.infer<typeof OrderDetailSchema>;
+
+// カスタムエラークラス
+class RetryableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RetryableError";
+  }
 }
 
-interface EventBridgeMessage {
-  version: string;
-  id: string;
-  "detail-type": string;
-  source: string;
-  detail: OrderDetail;
+class NonRetryableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NonRetryableError";
+  }
 }
 
-export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
-  console.log("Received SQS event:", JSON.stringify(event, null, 2));
+const lambdaHandler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
+  logger.info("Processing payment batch", {
+    recordCount: event.Records.length,
+  });
 
   const batchItemFailures: SQSBatchItemFailure[] = [];
 
   for (const record of event.Records) {
+    const segment = tracer.getSegment();
+    const subsegment = segment?.addNewSubsegment("processRecord");
+
     try {
       // SQSメッセージからEventBridgeイベントを取得
-      const eventBridgeMessage: EventBridgeMessage = JSON.parse(record.body);
-      const orderDetail = eventBridgeMessage.detail;
+      const parseResult = EventBridgeMessageSchema.safeParse(
+        JSON.parse(record.body)
+      );
 
-      console.log(`Processing payment for order: ${orderDetail.orderId}`);
+      if (!parseResult.success) {
+        logger.error("Invalid message format", {
+          messageId: record.messageId,
+          errors: parseResult.error.errors,
+        });
+        throw new NonRetryableError("Invalid message format");
+      }
 
-      // 決済処理（シミュレーション）
+      const orderDetail = parseResult.data.detail;
+
+      logger.info("Processing payment", {
+        orderId: orderDetail.orderId,
+        customerId: orderDetail.customerId,
+        amount: orderDetail.totalAmount,
+      });
+
+      tracer.putAnnotation("orderId", orderDetail.orderId);
+      subsegment?.addAnnotation("orderId", orderDetail.orderId);
+
+      // 決済処理
       const paymentResult = await processPayment(orderDetail);
 
       if (paymentResult.success) {
-        // 決済成功イベントを発行
         await publishPaymentEvent({
           orderId: orderDetail.orderId,
           customerId: orderDetail.customerId,
           amount: orderDetail.totalAmount,
           status: "COMPLETED",
+          transactionId: paymentResult.transactionId!,
+        });
+
+        metrics.addMetric("PaymentCompleted", MetricUnit.Count, 1);
+        metrics.addMetric(
+          "PaymentAmount",
+          MetricUnit.Count,
+          orderDetail.totalAmount
+        );
+
+        logger.info("Payment completed", {
+          orderId: orderDetail.orderId,
           transactionId: paymentResult.transactionId,
         });
-        console.log(`Payment completed for order: ${orderDetail.orderId}`);
       } else {
-        // 決済失敗イベントを発行
         await publishPaymentEvent({
           orderId: orderDetail.orderId,
           customerId: orderDetail.customerId,
           amount: orderDetail.totalAmount,
           status: "FAILED",
+          reason: paymentResult.reason!,
+        });
+
+        metrics.addMetric("PaymentFailed", MetricUnit.Count, 1);
+
+        logger.warn("Payment failed", {
+          orderId: orderDetail.orderId,
           reason: paymentResult.reason,
         });
-        console.log(`Payment failed for order: ${orderDetail.orderId}`);
       }
     } catch (error) {
-      console.error(`Error processing record ${record.messageId}:`, error);
-      batchItemFailures.push({ itemIdentifier: record.messageId });
+      if (error instanceof NonRetryableError) {
+        logger.error("Non-retryable error", {
+          messageId: record.messageId,
+          error: error.message,
+        });
+        // メッセージを成功として扱い、DLQに行かないようにする
+      } else {
+        logger.error("Retryable error", {
+          messageId: record.messageId,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+        batchItemFailures.push({ itemIdentifier: record.messageId });
+      }
+    } finally {
+      subsegment?.close();
     }
   }
 
@@ -274,12 +375,10 @@ interface PaymentResult {
 }
 
 async function processPayment(order: OrderDetail): Promise<PaymentResult> {
-  // 実際の決済処理をシミュレート
-  // 本番環境では外部決済APIを呼び出す
-
-  console.log(
-    `Processing payment of ¥${order.totalAmount} for customer ${order.customerId}`
-  );
+  logger.info("Calling payment API", {
+    orderId: order.orderId,
+    amount: order.totalAmount,
+  });
 
   // 処理時間をシミュレート
   await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -324,8 +423,16 @@ async function publishPaymentEvent(detail: PaymentEventDetail): Promise<void> {
     })
   );
 
-  console.log(`Published ${detailType} event for order: ${detail.orderId}`);
+  logger.info("Payment event published", {
+    detailType,
+    orderId: detail.orderId,
+  });
 }
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
 ---

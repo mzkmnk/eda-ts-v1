@@ -61,91 +61,38 @@
 
 ## コードサンプル
 
-### 構造化ログの実装
+### 構造化ログの実装（Lambda Powertools）
 
 ```typescript
-// lambda/shared/logger.ts
-interface LogContext {
-  requestId?: string;
-  orderId?: string;
-  customerId?: string;
-  [key: string]: any;
-}
-
-class Logger {
-  private context: LogContext = {};
-
-  setContext(context: LogContext): void {
-    this.context = { ...this.context, ...context };
-  }
-
-  private log(level: string, message: string, data?: object): void {
-    console.log(
-      JSON.stringify({
-        timestamp: new Date().toISOString(),
-        level,
-        message,
-        ...this.context,
-        ...data,
-      })
-    );
-  }
-
-  info(message: string, data?: object): void {
-    this.log("INFO", message, data);
-  }
-
-  warn(message: string, data?: object): void {
-    this.log("WARN", message, data);
-  }
-
-  error(message: string, error?: Error, data?: object): void {
-    this.log("ERROR", message, {
-      ...data,
-      error: error
-        ? {
-            name: error.name,
-            message: error.message,
-            stack: error.stack,
-          }
-        : undefined,
-    });
-  }
-
-  debug(message: string, data?: object): void {
-    if (process.env.LOG_LEVEL === "DEBUG") {
-      this.log("DEBUG", message, data);
-    }
-  }
-}
-
-export const logger = new Logger();
-```
-
-### Lambda 関数での使用例
-
-```typescript
+// Lambda Powertools を使用した構造化ログ
 // lambda/order-api/index.ts
+import { Logger } from "@aws-lambda-powertools/logger";
 import { APIGatewayProxyEvent, Context } from "aws-lambda";
-import { logger } from "../shared/logger";
+
+const logger = new Logger({
+  serviceName: "order-api",
+  logLevel: process.env.LOG_LEVEL || "INFO",
+  persistentLogAttributes: {
+    environment: process.env.ENVIRONMENT || "development",
+  },
+});
 
 export const handler = async (
   event: APIGatewayProxyEvent,
   context: Context
 ) => {
-  // リクエストコンテキストを設定
-  logger.setContext({
-    requestId: context.awsRequestId,
-    functionName: context.functionName,
+  // リクエストコンテキストを自動追加
+  logger.addContext(context);
+
+  // カスタム属性を追加
+  logger.appendKeys({
+    path: event.path,
+    method: event.httpMethod,
   });
 
-  logger.info("Request received", {
-    method: event.httpMethod,
-    path: event.path,
-  });
+  logger.info("Request received");
 
   try {
-    // 処理
     const result = await processRequest(event);
 
     logger.info("Request completed", {
@@ -160,48 +107,96 @@ export const handler = async (
 };
 ```
 
-### CloudWatch メトリクスの発行
+> **Note**: Lambda Powertools の Logger は自動的に JSON 形式で出力し、Lambda コンテキスト（requestId、functionName など）を含めます。
+
+### Lambda 関数での使用例（Lambda Powertools + Middy）
 
 ```typescript
-// lambda/shared/metrics.ts
+// lambda/order-api/index.ts
 import {
-  CloudWatchClient,
-  PutMetricDataCommand,
-} from "@aws-sdk/client-cloudwatch";
+  APIGatewayProxyEvent,
+  APIGatewayProxyResult,
+  Context,
+} from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
 
-const cloudwatch = new CloudWatchClient({});
+// Powertools インスタンス
+const logger = new Logger({ serviceName: "order-api" });
+const tracer = new Tracer({ serviceName: "order-api" });
+const metrics = new Metrics({
+  serviceName: "order-api",
+  namespace: "OrderService",
+});
 
-export async function publishMetric(
-  metricName: string,
-  value: number,
-  unit: "Count" | "Milliseconds" | "Bytes" = "Count",
-  dimensions?: { Name: string; Value: string }[]
-): Promise<void> {
-  await cloudwatch.send(
-    new PutMetricDataCommand({
-      Namespace: "OrderService",
-      MetricData: [
-        {
-          MetricName: metricName,
-          Value: value,
-          Unit: unit,
-          Dimensions: dimensions,
-          Timestamp: new Date(),
-        },
-      ],
-    })
-  );
-}
+const lambdaHandler = async (
+  event: APIGatewayProxyEvent,
+  context: Context
+): Promise<APIGatewayProxyResult> => {
+  // リクエスト情報をログに追加
+  logger.appendKeys({
+    path: event.path,
+    method: event.httpMethod,
+  });
+
+  logger.info("Request received");
+
+  try {
+    const result = await processRequest(event);
+
+    // カスタムメトリクス
+    metrics.addMetric("RequestProcessed", MetricUnit.Count, 1);
+
+    logger.info("Request completed", { statusCode: result.statusCode });
+
+    return result;
+  } catch (error) {
+    logger.error("Request failed", error as Error);
+    metrics.addMetric("RequestFailed", MetricUnit.Count, 1);
+    throw error;
+  }
+};
+
+// Middy でミドルウェアをラップ
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
+```
+
+### CloudWatch メトリクスの発行（Lambda Powertools）
+
+```typescript
+// Lambda Powertools Metrics を使用
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+
+const metrics = new Metrics({
+  serviceName: "order-api",
+  namespace: "OrderService",
+});
 
 // 使用例
-await publishMetric("OrderCreated", 1, "Count", [
-  { Name: "Environment", Value: "production" },
-]);
+metrics.addMetric("OrderCreated", MetricUnit.Count, 1);
+metrics.addMetric("ProcessingTime", MetricUnit.Milliseconds, 150);
+metrics.addMetric("OrderAmount", MetricUnit.Count, 5000);
 
-await publishMetric("ProcessingTime", 150, "Milliseconds", [
-  { Name: "Operation", Value: "CreateOrder" },
-]);
+// ディメンションを追加
+metrics.addDimension("Environment", "production");
+metrics.addDimension("Operation", "CreateOrder");
+
+// メタデータを追加（メトリクスには含まれないが、ログに出力される）
+metrics.addMetadata("orderId", "ORD-12345");
+
+// 高解像度メトリクス（1秒単位）
+metrics.addMetric("HighResolutionMetric", MetricUnit.Count, 1);
 ```
+
+> **Note**: `logMetrics` ミドルウェアを使用すると、Lambda 実行終了時に自動的にメトリクスが CloudWatch に送信されます。
 
 ### X-Ray トレーシングの設定（CDK）
 
@@ -211,13 +206,27 @@ import * as cdk from "aws-cdk-lib";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs";
 
+// Lambda Powertools 用の共通環境変数
+const powertoolsEnv = {
+  POWERTOOLS_SERVICE_NAME: "order-api",
+  POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+  LOG_LEVEL: "INFO",
+};
+
 const orderApiFunction = new nodejs.NodejsFunction(this, "OrderApiFunction", {
   entry: "lambda/order-api/index.ts",
   handler: "handler",
   runtime: lambda.Runtime.NODEJS_20_X,
+  memorySize: 256,
   tracing: lambda.Tracing.ACTIVE, // X-Ray有効化
   environment: {
+    ...powertoolsEnv,
     AWS_XRAY_CONTEXT_MISSING: "LOG_ERROR",
+  },
+  bundling: {
+    minify: true,
+    sourceMap: true,
+    externalModules: ["@aws-sdk/*"],
   },
 });
 ```

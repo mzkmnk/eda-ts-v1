@@ -109,13 +109,14 @@ process.env.AWS_SECRET_ACCESS_KEY = "test";
 process.env.LOCALSTACK_HOSTNAME = "localhost";
 ```
 
-### 単体テスト
+### 単体テスト（Zod バリデーション）
 
 ```typescript
 // test/unit/order-validator.test.ts
 import {
   validateOrder,
   OrderValidationError,
+  CreateOrderRequestSchema,
 } from "../../lambda/order-api/validator";
 
 describe("Order Validator", () => {
@@ -126,7 +127,10 @@ describe("Order Validator", () => {
         items: [{ productId: "PROD-A", quantity: 2, price: 1000 }],
       };
 
-      expect(() => validateOrder(order)).not.toThrow();
+      const result = validateOrder(order);
+
+      expect(result.customerId).toBe("CUST-001");
+      expect(result.items).toHaveLength(1);
     });
 
     it("should throw error for missing customerId", () => {
@@ -134,10 +138,8 @@ describe("Order Validator", () => {
         items: [{ productId: "PROD-A", quantity: 1, price: 1000 }],
       };
 
-      expect(() => validateOrder(order as any)).toThrow(OrderValidationError);
-      expect(() => validateOrder(order as any)).toThrow(
-        "customerId is required"
-      );
+      expect(() => validateOrder(order)).toThrow(OrderValidationError);
+      expect(() => validateOrder(order)).toThrow("customerId is required");
     });
 
     it("should throw error for empty items", () => {
@@ -157,7 +159,7 @@ describe("Order Validator", () => {
       };
 
       expect(() => validateOrder(order)).toThrow(OrderValidationError);
-      expect(() => validateOrder(order)).toThrow("price must be positive");
+      expect(() => validateOrder(order)).toThrow("price must be non-negative");
     });
 
     it("should throw error for zero quantity", () => {
@@ -169,52 +171,88 @@ describe("Order Validator", () => {
       expect(() => validateOrder(order)).toThrow(OrderValidationError);
       expect(() => validateOrder(order)).toThrow("quantity must be positive");
     });
+
+    it("should throw error for missing productId", () => {
+      const order = {
+        customerId: "CUST-001",
+        items: [{ productId: "", quantity: 1, price: 1000 }],
+      };
+
+      expect(() => validateOrder(order)).toThrow(OrderValidationError);
+      expect(() => validateOrder(order)).toThrow("productId is required");
+    });
+  });
+
+  describe("CreateOrderRequestSchema", () => {
+    it("should parse valid order", () => {
+      const order = {
+        customerId: "CUST-001",
+        items: [{ productId: "PROD-A", quantity: 2, price: 1000 }],
+      };
+
+      const result = CreateOrderRequestSchema.safeParse(order);
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.customerId).toBe("CUST-001");
+      }
+    });
+
+    it("should fail for invalid order", () => {
+      const order = {
+        customerId: "",
+        items: [],
+      };
+
+      const result = CreateOrderRequestSchema.safeParse(order);
+
+      expect(result.success).toBe(false);
+    });
   });
 });
 ```
 
-### バリデーション関数の実装
+### バリデーション関数の実装（Zod）
 
 ```typescript
 // lambda/order-api/validator.ts
+import { z } from "zod";
+
+// Zod スキーマ定義
+export const OrderItemSchema = z.object({
+  productId: z.string().min(1, "productId is required"),
+  quantity: z.number().int().positive("quantity must be positive"),
+  price: z.number().nonnegative("price must be non-negative"),
+});
+
+export const CreateOrderRequestSchema = z.object({
+  customerId: z.string().min(1, "customerId is required"),
+  items: z.array(OrderItemSchema).min(1, "items must not be empty"),
+});
+
+export type OrderItem = z.infer<typeof OrderItemSchema>;
+export type CreateOrderRequest = z.infer<typeof CreateOrderRequestSchema>;
+
+// カスタムエラークラス
 export class OrderValidationError extends Error {
-  constructor(message: string) {
+  constructor(message: string, public readonly errors: z.ZodIssue[]) {
     super(message);
     this.name = "OrderValidationError";
   }
 }
 
-interface OrderItem {
-  productId: string;
-  quantity: number;
-  price: number;
-}
+// バリデーション関数
+export function validateOrder(order: unknown): CreateOrderRequest {
+  const result = CreateOrderRequestSchema.safeParse(order);
 
-interface CreateOrderRequest {
-  customerId: string;
-  items: OrderItem[];
-}
-
-export function validateOrder(order: CreateOrderRequest): void {
-  if (!order.customerId) {
-    throw new OrderValidationError("customerId is required");
+  if (!result.success) {
+    throw new OrderValidationError(
+      result.error.errors[0].message,
+      result.error.errors
+    );
   }
 
-  if (!order.items || order.items.length === 0) {
-    throw new OrderValidationError("items must not be empty");
-  }
-
-  for (const item of order.items) {
-    if (!item.productId) {
-      throw new OrderValidationError("productId is required");
-    }
-    if (item.quantity <= 0) {
-      throw new OrderValidationError("quantity must be positive");
-    }
-    if (item.price < 0) {
-      throw new OrderValidationError("price must be positive");
-    }
-  }
+  return result.data;
 }
 ```
 
@@ -613,6 +651,10 @@ pnpm test -- --testPathPattern=order-validator
       ✓ should throw error for empty items (1 ms)
       ✓ should throw error for negative price (1 ms)
       ✓ should throw error for zero quantity (1 ms)
+      ✓ should throw error for missing productId (1 ms)
+    CreateOrderRequestSchema
+      ✓ should parse valid order (1 ms)
+      ✓ should fail for invalid order (1 ms)
 
  PASS  test/integration/order-service.test.ts
   Order Service Integration Tests
@@ -624,7 +666,7 @@ pnpm test -- --testPathPattern=order-validator
       ✓ should return 404 for non-existing order (20 ms)
 
 Test Suites: 2 passed, 2 total
-Tests:       9 passed, 9 total
+Tests:       12 passed, 12 total
 ```
 
 </details>

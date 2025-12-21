@@ -105,11 +105,24 @@ export class OrderTable extends Construct {
 }
 ```
 
-### Lambda 関数の実装
+### Lambda 関数の実装（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/order-api/index.ts
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
+import {
+  APIGatewayProxyEvent,
+  APIGatewayProxyResult,
+  Context,
+} from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import httpJsonBodyParser from "@middy/http-json-body-parser";
+import httpErrorHandler from "@middy/http-error-handler";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -117,87 +130,87 @@ import {
   GetCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { z } from "zod";
 import { randomUUID } from "crypto";
+import createHttpError from "http-errors";
 
-const client = new DynamoDBClient({
-  endpoint: process.env.LOCALSTACK_HOSTNAME
-    ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
-    : undefined,
+// Powertools インスタンス
+const logger = new Logger({ serviceName: "order-api" });
+const tracer = new Tracer({ serviceName: "order-api" });
+const metrics = new Metrics({
+  serviceName: "order-api",
+  namespace: "OrderService",
 });
-const docClient = DynamoDBDocumentClient.from(client);
+
+// DynamoDB クライアント（トレーシング対応）
+const dynamoClient = tracer.captureAWSv3Client(
+  new DynamoDBClient({
+    endpoint: process.env.LOCALSTACK_HOSTNAME
+      ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+      : undefined,
+  })
+);
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 const TABLE_NAME = process.env.TABLE_NAME || "Orders";
 
-interface OrderItem {
-  productId: string;
-  quantity: number;
-  price: number;
-}
+// Zod スキーマ定義
+const OrderItemSchema = z.object({
+  productId: z.string().min(1, "productId is required"),
+  quantity: z.number().int().positive("quantity must be positive"),
+  price: z.number().nonnegative("price must be non-negative"),
+});
 
-interface CreateOrderRequest {
-  customerId: string;
-  items: OrderItem[];
-}
+const CreateOrderRequestSchema = z.object({
+  customerId: z.string().min(1, "customerId is required"),
+  items: z.array(OrderItemSchema).min(1, "items must not be empty"),
+});
 
+type CreateOrderRequest = z.infer<typeof CreateOrderRequestSchema>;
+
+// 注文の型定義
 interface Order {
   orderId: string;
   customerId: string;
-  items: OrderItem[];
+  items: z.infer<typeof OrderItemSchema>[];
   totalAmount: number;
   status: "PENDING" | "CONFIRMED" | "SHIPPED" | "DELIVERED";
   createdAt: string;
   updatedAt: string;
 }
 
-export const handler = async (
-  event: APIGatewayProxyEvent
+// メインハンドラー
+const lambdaHandler = async (
+  event: APIGatewayProxyEvent,
+  context: Context
 ): Promise<APIGatewayProxyResult> => {
-  console.log("Request:", JSON.stringify(event, null, 2));
+  logger.appendKeys({ path: event.path, method: event.httpMethod });
 
-  try {
-    switch (event.httpMethod) {
-      case "POST":
-        return await createOrder(event);
-      case "GET":
-        if (event.pathParameters?.orderId) {
-          return await getOrder(event.pathParameters.orderId);
-        }
-        return await listOrders();
-      default:
-        return {
-          statusCode: 405,
-          body: JSON.stringify({ message: "Method not allowed" }),
-        };
-    }
-  } catch (error) {
-    console.error("Error:", error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ message: "Internal server error" }),
-    };
+  switch (event.httpMethod) {
+    case "POST":
+      return await createOrder(event);
+    case "GET":
+      if (event.pathParameters?.orderId) {
+        return await getOrder(event.pathParameters.orderId);
+      }
+      return await listOrders();
+    default:
+      throw createHttpError(405, "Method not allowed");
   }
 };
 
 async function createOrder(
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> {
-  if (!event.body) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ message: "Request body is required" }),
-    };
+  // リクエストボディのバリデーション
+  const parseResult = CreateOrderRequestSchema.safeParse(event.body);
+
+  if (!parseResult.success) {
+    logger.warn("Validation failed", { errors: parseResult.error.errors });
+    throw createHttpError(400, parseResult.error.errors[0].message);
   }
 
-  const request: CreateOrderRequest = JSON.parse(event.body);
-
-  // バリデーション
-  if (!request.customerId || !request.items || request.items.length === 0) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ message: "customerId and items are required" }),
-    };
-  }
-
+  const request = parseResult.data;
   const totalAmount = request.items.reduce(
     (sum, item) => sum + item.price * item.quantity,
     0
@@ -214,12 +227,22 @@ async function createOrder(
     updatedAt: now,
   };
 
+  // トレーシング用のアノテーション
+  tracer.putAnnotation("orderId", order.orderId);
+  tracer.putAnnotation("customerId", order.customerId);
+
   await docClient.send(
     new PutCommand({
       TableName: TABLE_NAME,
       Item: order,
     })
   );
+
+  // メトリクス記録
+  metrics.addMetric("OrderCreated", MetricUnit.Count, 1);
+  metrics.addMetric("OrderAmount", MetricUnit.Count, totalAmount);
+
+  logger.info("Order created", { orderId: order.orderId, totalAmount });
 
   return {
     statusCode: 201,
@@ -229,6 +252,8 @@ async function createOrder(
 }
 
 async function getOrder(orderId: string): Promise<APIGatewayProxyResult> {
+  tracer.putAnnotation("orderId", orderId);
+
   const result = await docClient.send(
     new GetCommand({
       TableName: TABLE_NAME,
@@ -237,10 +262,8 @@ async function getOrder(orderId: string): Promise<APIGatewayProxyResult> {
   );
 
   if (!result.Item) {
-    return {
-      statusCode: 404,
-      body: JSON.stringify({ message: "Order not found" }),
-    };
+    logger.warn("Order not found", { orderId });
+    throw createHttpError(404, "Order not found");
   }
 
   return {
@@ -264,6 +287,14 @@ async function listOrders(): Promise<APIGatewayProxyResult> {
     body: JSON.stringify({ orders: result.Items || [] }),
   };
 }
+
+// Middy でミドルウェアをラップ
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }))
+  .use(httpJsonBodyParser()) // JSON ボディを自動パース
+  .use(httpErrorHandler()); // エラーハンドリング
 ```
 
 ### API Gateway の定義（CDK）
@@ -281,6 +312,13 @@ import * as path from "path";
 export class EdaStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    // Lambda Powertools 用の共通環境変数
+    const powertoolsEnv = {
+      POWERTOOLS_SERVICE_NAME: "order-api",
+      POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+      LOG_LEVEL: "INFO",
+    };
 
     // DynamoDBテーブル
     const ordersTable = new dynamodb.Table(this, "OrdersTable", {
@@ -302,8 +340,16 @@ export class EdaStack extends cdk.Stack {
         handler: "handler",
         runtime: lambda.Runtime.NODEJS_20_X,
         timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        tracing: lambda.Tracing.ACTIVE,
         environment: {
+          ...powertoolsEnv,
           TABLE_NAME: ordersTable.tableName,
+        },
+        bundling: {
+          minify: true,
+          sourceMap: true,
+          externalModules: ["@aws-sdk/*"],
         },
       }
     );

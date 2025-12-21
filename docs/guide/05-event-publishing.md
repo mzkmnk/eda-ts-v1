@@ -94,7 +94,7 @@ interface OrderCreatedEvent {
 
 ## コードサンプル
 
-### イベント発行ユーティリティ
+### イベント発行ユーティリティ（Lambda Powertools + Zod）
 
 ```typescript
 // lambda/shared/event-publisher.ts
@@ -102,100 +102,191 @@ import {
   EventBridgeClient,
   PutEventsCommand,
 } from "@aws-sdk/client-eventbridge";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { z } from "zod";
 
-const client = new EventBridgeClient({
-  endpoint: process.env.LOCALSTACK_HOSTNAME
-    ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
-    : undefined,
-});
+const logger = new Logger({ serviceName: "event-publisher" });
+const tracer = new Tracer({ serviceName: "event-publisher" });
+
+const client = tracer.captureAWSv3Client(
+  new EventBridgeClient({
+    endpoint: process.env.LOCALSTACK_HOSTNAME
+      ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+      : undefined,
+  })
+);
 
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME || "order-events";
 
-export interface EventPayload<T> {
+// イベントペイロードのスキーマ
+const EventPayloadSchema = z.object({
+  source: z.string().min(1),
+  detailType: z.string().min(1),
+  detail: z.record(z.unknown()),
+});
+
+export type EventPayload<T extends Record<string, unknown>> = {
   source: string;
   detailType: string;
   detail: T;
-}
+};
 
-export async function publishEvent<T>(payload: EventPayload<T>): Promise<void> {
-  const command = new PutEventsCommand({
-    Entries: [
-      {
-        Source: payload.source,
-        DetailType: payload.detailType,
-        Detail: JSON.stringify(payload.detail),
-        EventBusName: EVENT_BUS_NAME,
-      },
-    ],
-  });
-
-  const response = await client.send(command);
-
-  if (response.FailedEntryCount && response.FailedEntryCount > 0) {
-    console.error("Failed to publish event:", response.Entries);
-    throw new Error("Failed to publish event");
+export async function publishEvent<T extends Record<string, unknown>>(
+  payload: EventPayload<T>
+): Promise<string> {
+  // バリデーション
+  const parseResult = EventPayloadSchema.safeParse(payload);
+  if (!parseResult.success) {
+    logger.error("Invalid event payload", { errors: parseResult.error.errors });
+    throw new Error(`Invalid event payload: ${parseResult.error.message}`);
   }
 
-  console.log("Event published successfully:", {
-    source: payload.source,
-    detailType: payload.detailType,
-    eventId: response.Entries?.[0]?.EventId,
-  });
+  const segment = tracer.getSegment();
+  const subsegment = segment?.addNewSubsegment("publishEvent");
+
+  try {
+    const command = new PutEventsCommand({
+      Entries: [
+        {
+          Source: payload.source,
+          DetailType: payload.detailType,
+          Detail: JSON.stringify(payload.detail),
+          EventBusName: EVENT_BUS_NAME,
+        },
+      ],
+    });
+
+    const response = await client.send(command);
+
+    if (response.FailedEntryCount && response.FailedEntryCount > 0) {
+      const failedEntry = response.Entries?.[0];
+      logger.error("Failed to publish event", {
+        errorCode: failedEntry?.ErrorCode,
+        errorMessage: failedEntry?.ErrorMessage,
+      });
+      throw new Error(`Failed to publish event: ${failedEntry?.ErrorMessage}`);
+    }
+
+    const eventId = response.Entries?.[0]?.EventId || "unknown";
+
+    logger.info("Event published successfully", {
+      source: payload.source,
+      detailType: payload.detailType,
+      eventId,
+    });
+
+    subsegment?.addAnnotation("eventId", eventId);
+    subsegment?.addAnnotation("detailType", payload.detailType);
+
+    return eventId;
+  } finally {
+    subsegment?.close();
+  }
 }
 ```
 
-### 注文作成時のイベント発行
+### 注文作成時のイベント発行（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/order-api/index.ts
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
+import {
+  APIGatewayProxyEvent,
+  APIGatewayProxyResult,
+  Context,
+} from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import httpJsonBodyParser from "@middy/http-json-body-parser";
+import httpErrorHandler from "@middy/http-error-handler";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { publishEvent } from "../shared/event-publisher";
+import { z } from "zod";
 import { randomUUID } from "crypto";
+import createHttpError from "http-errors";
 
-const client = new DynamoDBClient({
-  endpoint: process.env.LOCALSTACK_HOSTNAME
-    ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
-    : undefined,
+const logger = new Logger({ serviceName: "order-api" });
+const tracer = new Tracer({ serviceName: "order-api" });
+const metrics = new Metrics({
+  serviceName: "order-api",
+  namespace: "OrderService",
 });
-const docClient = DynamoDBDocumentClient.from(client);
+
+const dynamoClient = tracer.captureAWSv3Client(
+  new DynamoDBClient({
+    endpoint: process.env.LOCALSTACK_HOSTNAME
+      ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+      : undefined,
+  })
+);
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 const TABLE_NAME = process.env.TABLE_NAME || "Orders";
 
-interface OrderItem {
-  productId: string;
-  quantity: number;
-  price: number;
-}
+// Zod スキーマ
+const OrderItemSchema = z.object({
+  productId: z.string().min(1),
+  quantity: z.number().int().positive(),
+  price: z.number().nonnegative(),
+});
+
+const CreateOrderRequestSchema = z.object({
+  customerId: z.string().min(1),
+  items: z.array(OrderItemSchema).min(1),
+});
+
+// OrderCreated イベントのスキーマ
+const OrderCreatedEventSchema = z.object({
+  version: z.literal("1.0"),
+  orderId: z.string(),
+  customerId: z.string(),
+  items: z.array(OrderItemSchema),
+  totalAmount: z.number(),
+  status: z.literal("PENDING"),
+  createdAt: z.string(),
+});
+
+type OrderCreatedEvent = z.infer<typeof OrderCreatedEventSchema>;
 
 interface Order {
   orderId: string;
   customerId: string;
-  items: OrderItem[];
+  items: z.infer<typeof OrderItemSchema>[];
   totalAmount: number;
   status: string;
   createdAt: string;
   updatedAt: string;
 }
 
-export const handler = async (
-  event: APIGatewayProxyEvent
+const lambdaHandler = async (
+  event: APIGatewayProxyEvent,
+  context: Context
 ): Promise<APIGatewayProxyResult> => {
   if (event.httpMethod === "POST") {
     return await createOrder(event);
   }
-  // ... 他のメソッド
-  return { statusCode: 405, body: "Method not allowed" };
+  throw createHttpError(405, "Method not allowed");
 };
 
 async function createOrder(
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> {
-  const body = JSON.parse(event.body || "{}");
+  const parseResult = CreateOrderRequestSchema.safeParse(event.body);
 
+  if (!parseResult.success) {
+    logger.warn("Validation failed", { errors: parseResult.error.errors });
+    throw createHttpError(400, parseResult.error.errors[0].message);
+  }
+
+  const body = parseResult.data;
   const totalAmount = body.items.reduce(
-    (sum: number, item: OrderItem) => sum + item.price * item.quantity,
+    (sum, item) => sum + item.price * item.quantity,
     0
   );
 
@@ -210,6 +301,8 @@ async function createOrder(
     updatedAt: now,
   };
 
+  tracer.putAnnotation("orderId", order.orderId);
+
   // Step 1: DynamoDBに保存
   await docClient.send(
     new PutCommand({
@@ -218,20 +311,32 @@ async function createOrder(
     })
   );
 
+  logger.info("Order saved to DynamoDB", { orderId: order.orderId });
+
   // Step 2: イベントを発行
-  await publishEvent({
+  const eventDetail: OrderCreatedEvent = {
+    version: "1.0",
+    orderId: order.orderId,
+    customerId: order.customerId,
+    items: order.items,
+    totalAmount: order.totalAmount,
+    status: "PENDING",
+    createdAt: order.createdAt,
+  };
+
+  const eventId = await publishEvent({
     source: "order-service",
     detailType: "OrderCreated",
-    detail: {
-      version: "1.0",
-      orderId: order.orderId,
-      customerId: order.customerId,
-      items: order.items,
-      totalAmount: order.totalAmount,
-      status: order.status,
-      createdAt: order.createdAt,
-    },
+    detail: eventDetail,
   });
+
+  logger.info("OrderCreated event published", {
+    orderId: order.orderId,
+    eventId,
+  });
+
+  metrics.addMetric("OrderCreated", MetricUnit.Count, 1);
+  metrics.addMetric("OrderAmount", MetricUnit.Count, totalAmount);
 
   return {
     statusCode: 201,
@@ -239,6 +344,13 @@ async function createOrder(
     body: JSON.stringify(order),
   };
 }
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }))
+  .use(httpJsonBodyParser())
+  .use(httpErrorHandler());
 ```
 
 ### CDK で EventBridge 権限を付与
@@ -257,6 +369,13 @@ import * as path from "path";
 export class EdaStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    // Lambda Powertools 用の共通環境変数
+    const powertoolsEnv = {
+      POWERTOOLS_SERVICE_NAME: "order-api",
+      POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+      LOG_LEVEL: "INFO",
+    };
 
     // イベントバス
     const eventBus = new events.EventBus(this, "OrderEventBus", {
@@ -283,13 +402,17 @@ export class EdaStack extends cdk.Stack {
         handler: "handler",
         runtime: lambda.Runtime.NODEJS_20_X,
         timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        tracing: lambda.Tracing.ACTIVE,
         environment: {
+          ...powertoolsEnv,
           TABLE_NAME: ordersTable.tableName,
           EVENT_BUS_NAME: eventBus.eventBusName,
         },
         bundling: {
-          // 共有モジュールをバンドルに含める
-          externalModules: [],
+          minify: true,
+          sourceMap: true,
+          externalModules: ["@aws-sdk/*"],
         },
       }
     );

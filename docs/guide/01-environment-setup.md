@@ -72,10 +72,20 @@ cd eda-learning
 pnpm init
 
 # TypeScriptと必要なパッケージのインストール
-pnpm add -D typescript @types/node ts-node
+pnpm add -D typescript @types/node @types/aws-lambda ts-node
 pnpm add -D aws-cdk aws-cdk-lib constructs
 pnpm add -D esbuild
-pnpm add @aws-sdk/client-eventbridge @aws-sdk/client-dynamodb @aws-sdk/client-sqs @aws-sdk/client-sns
+
+# AWS SDK
+pnpm add @aws-sdk/client-eventbridge @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
+pnpm add @aws-sdk/client-sqs @aws-sdk/client-sns
+
+# Lambda Powertools
+pnpm add @aws-lambda-powertools/logger @aws-lambda-powertools/tracer
+pnpm add @aws-lambda-powertools/metrics @aws-lambda-powertools/idempotency
+
+# バリデーション & ミドルウェア
+pnpm add zod @middy/core
 ```
 
 ### Step 2: TypeScript 設定
@@ -294,6 +304,7 @@ pipx install awscli-local
     "localstack:logs": "docker compose logs -f"
   },
   "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
     "@types/node": "^20.10.0",
     "aws-cdk": "^2.170.0",
     "aws-cdk-lib": "^2.170.0",
@@ -305,10 +316,17 @@ pipx install awscli-local
     "typescript": "^5.3.0"
   },
   "dependencies": {
+    "@aws-lambda-powertools/idempotency": "^2.10.0",
+    "@aws-lambda-powertools/logger": "^2.10.0",
+    "@aws-lambda-powertools/metrics": "^2.10.0",
+    "@aws-lambda-powertools/tracer": "^2.10.0",
     "@aws-sdk/client-dynamodb": "^3.700.0",
     "@aws-sdk/client-eventbridge": "^3.700.0",
     "@aws-sdk/client-sns": "^3.700.0",
-    "@aws-sdk/client-sqs": "^3.700.0"
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0",
+    "@middy/core": "^5.5.0",
+    "zod": "^3.23.0"
   }
 }
 ```

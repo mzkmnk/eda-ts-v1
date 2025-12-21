@@ -85,40 +85,88 @@ type OrderCreatedEvent = EventBridgeEvent<"OrderCreated", OrderDetail>;
 
 ## コードサンプル
 
-### Lambda 関数の実装
+### Lambda 関数の実装（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/order-processor/index.ts
-import { EventBridgeEvent, Context } from "aws-lambda";
+import { EventBridgeEvent } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
+import { z } from "zod";
 
-interface OrderDetail {
-  orderId: string;
-  customerId: string;
-  totalAmount: number;
-  items: Array<{
-    productId: string;
-    quantity: number;
-    price: number;
-  }>;
-}
+// Powertools インスタンスの初期化
+const logger = new Logger({ serviceName: "order-processor" });
+const tracer = new Tracer({ serviceName: "order-processor" });
+const metrics = new Metrics({
+  serviceName: "order-processor",
+  namespace: "OrderService",
+});
 
-export const handler = async (
-  event: EventBridgeEvent<"OrderCreated", OrderDetail>,
-  context: Context
+// Zod スキーマ定義
+const OrderItemSchema = z.object({
+  productId: z.string().min(1),
+  quantity: z.number().int().positive(),
+  price: z.number().nonnegative(),
+});
+
+const OrderDetailSchema = z.object({
+  orderId: z.string().min(1),
+  customerId: z.string().min(1),
+  totalAmount: z.number().nonnegative(),
+  items: z.array(OrderItemSchema).min(1),
+});
+
+type OrderDetail = z.infer<typeof OrderDetailSchema>;
+
+// メインハンドラー
+const lambdaHandler = async (
+  event: EventBridgeEvent<"OrderCreated", OrderDetail>
 ): Promise<void> => {
-  console.log("Received event:", JSON.stringify(event, null, 2));
+  // イベント詳細のバリデーション
+  const parseResult = OrderDetailSchema.safeParse(event.detail);
 
-  const { orderId, customerId, totalAmount } = event.detail;
+  if (!parseResult.success) {
+    logger.error("Invalid event detail", {
+      errors: parseResult.error.errors,
+    });
+    throw new Error(`Validation failed: ${parseResult.error.message}`);
+  }
 
-  console.log(`Processing order: ${orderId}`);
-  console.log(`Customer: ${customerId}`);
-  console.log(`Total: ¥${totalAmount}`);
+  const { orderId, customerId, totalAmount, items } = parseResult.data;
+
+  // 構造化ログ
+  logger.info("Processing order", {
+    orderId,
+    customerId,
+    totalAmount,
+    itemCount: items.length,
+  });
+
+  // カスタムメトリクス
+  metrics.addMetric("OrderProcessed", MetricUnit.Count, 1);
+  metrics.addMetric("OrderAmount", MetricUnit.Count, totalAmount);
+  metrics.addMetadata("orderId", orderId);
+
+  // トレーシング用のアノテーション
+  tracer.putAnnotation("orderId", orderId);
+  tracer.putAnnotation("customerId", customerId);
 
   // ここに注文処理ロジックを実装
   // 例: DynamoDBへの保存、外部APIの呼び出しなど
 
-  console.log(`Order ${orderId} processed successfully`);
+  logger.info("Order processed successfully", { orderId });
 };
+
+// Middy でミドルウェアをラップ
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
 ### CDK で Lambda と EventBridge ルールを定義
@@ -142,14 +190,31 @@ export class EdaStack extends cdk.Stack {
       eventBusName: "order-events",
     });
 
+    // Lambda Powertools 用の共通環境変数
+    const powertoolsEnv = {
+      POWERTOOLS_SERVICE_NAME: "order-processor",
+      POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+      LOG_LEVEL: "INFO",
+    };
+
     // Lambda関数の作成
     const orderProcessor = new nodejs.NodejsFunction(this, "OrderProcessor", {
       entry: path.join(__dirname, "../lambda/order-processor/index.ts"),
       handler: "handler",
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      tracing: lambda.Tracing.ACTIVE, // X-Ray トレーシング有効化
       environment: {
+        ...powertoolsEnv,
         EVENT_BUS_NAME: eventBus.eventBusName,
+      },
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        externalModules: [
+          "@aws-sdk/*", // Lambda ランタイムに含まれる SDK は除外
+        ],
       },
     });
 
@@ -248,35 +313,65 @@ type OrderCreatedEvent = EventBridgeEvent<"OrderCreated", OrderDetail>;
 
 ```typescript
 // lambda/order-processor/index.ts
-import { EventBridgeEvent, Context } from "aws-lambda";
+import { EventBridgeEvent } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
+import { z } from "zod";
 
-interface OrderDetail {
-  orderId: string;
-  customerId: string;
-  totalAmount: number;
-}
+const logger = new Logger({ serviceName: "order-processor" });
+const tracer = new Tracer({ serviceName: "order-processor" });
+const metrics = new Metrics({
+  serviceName: "order-processor",
+  namespace: "OrderService",
+});
 
-export const handler = async (
-  event: EventBridgeEvent<"OrderCreated", OrderDetail>,
-  context: Context
+const OrderDetailSchema = z.object({
+  orderId: z.string().min(1),
+  customerId: z.string().min(1),
+  totalAmount: z.number().nonnegative(),
+});
+
+type OrderDetail = z.infer<typeof OrderDetailSchema>;
+
+const lambdaHandler = async (
+  event: EventBridgeEvent<"OrderCreated", OrderDetail>
 ): Promise<{ statusCode: number; body: string }> => {
-  console.log("=== Order Created Event Received ===");
-  console.log("Event ID:", event.id);
-  console.log("Source:", event.source);
-  console.log("Detail Type:", event["detail-type"]);
+  const parseResult = OrderDetailSchema.safeParse(event.detail);
 
-  const { orderId, customerId, totalAmount } = event.detail;
+  if (!parseResult.success) {
+    logger.error("Validation failed", { errors: parseResult.error.errors });
+    throw new Error("Invalid event detail");
+  }
 
-  console.log("--- Order Details ---");
-  console.log("Order ID:", orderId);
-  console.log("Customer ID:", customerId);
-  console.log("Total Amount:", `¥${totalAmount.toLocaleString()}`);
+  const { orderId, customerId, totalAmount } = parseResult.data;
+
+  logger.info("Order details", {
+    eventId: event.id,
+    source: event.source,
+    detailType: event["detail-type"],
+    orderId,
+    customerId,
+    totalAmount: `¥${totalAmount.toLocaleString()}`,
+  });
+
+  metrics.addMetric("OrderProcessed", MetricUnit.Count, 1);
+  tracer.putAnnotation("orderId", orderId);
 
   return {
     statusCode: 200,
     body: JSON.stringify({ message: `Order ${orderId} processed` }),
   };
 };
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
 </details>
@@ -341,6 +436,13 @@ export class EdaStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
+    // Lambda Powertools 用の共通環境変数
+    const powertoolsEnv = {
+      POWERTOOLS_SERVICE_NAME: "order-processor",
+      POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+      LOG_LEVEL: "INFO",
+    };
+
     // イベントバス
     const eventBus = new events.EventBus(this, "OrderEventBus", {
       eventBusName: "order-events",
@@ -352,6 +454,14 @@ export class EdaStack extends cdk.Stack {
       handler: "handler",
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      tracing: lambda.Tracing.ACTIVE,
+      environment: powertoolsEnv,
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        externalModules: ["@aws-sdk/*"],
+      },
     });
 
     // EventBridgeルール
@@ -368,6 +478,13 @@ export class EdaStack extends cdk.Stack {
     orderCreatedRule.addTarget(new targets.LambdaFunction(orderProcessor));
   }
 }
+```
+
+確認コマンド:
+
+```bash
+npx cdklocal deploy
+awslocal events list-rules --event-bus-name order-events
 ```
 
 </details>

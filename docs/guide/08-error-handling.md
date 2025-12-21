@@ -133,14 +133,29 @@ export class EdaStack extends cdk.Stack {
 
     dlqAlarm.addAlarmAction(new cloudwatch_actions.SnsAction(alertTopic));
 
+    // Lambda Powertools 用の共通環境変数
+    const powertoolsEnv = {
+      POWERTOOLS_SERVICE_NAME: "dlq-processor",
+      POWERTOOLS_METRICS_NAMESPACE: "OrderService",
+      LOG_LEVEL: "INFO",
+    };
+
     // DLQ処理Lambda
     const dlqProcessor = new nodejs.NodejsFunction(this, "DLQProcessor", {
       entry: path.join(__dirname, "../lambda/dlq-processor/index.ts"),
       handler: "handler",
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(30),
+      memorySize: 256,
+      tracing: lambda.Tracing.ACTIVE,
       environment: {
+        ...powertoolsEnv,
         ORIGINAL_QUEUE_URL: paymentQueue.queueUrl,
+      },
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        externalModules: ["@aws-sdk/*"],
       },
     });
 
@@ -156,11 +171,37 @@ export class EdaStack extends cdk.Stack {
 }
 ```
 
-### エラーハンドリング付き Lambda
+### エラーハンドリング付き Lambda（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/payment-processor/index.ts
 import { SQSEvent, SQSBatchResponse, SQSBatchItemFailure } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
+import { z } from "zod";
+
+const logger = new Logger({ serviceName: "payment-processor" });
+const tracer = new Tracer({ serviceName: "payment-processor" });
+const metrics = new Metrics({
+  serviceName: "payment-processor",
+  namespace: "OrderService",
+});
+
+// Zod スキーマ
+const OrderDetailSchema = z.object({
+  orderId: z.string().min(1, "orderId is required"),
+  customerId: z.string().min(1, "customerId is required"),
+  totalAmount: z.number().nonnegative("totalAmount must be non-negative"),
+});
+
+const EventBridgeMessageSchema = z.object({
+  detail: OrderDetailSchema,
+});
 
 // カスタムエラークラス
 class RetryableError extends Error {
@@ -177,29 +218,39 @@ class NonRetryableError extends Error {
   }
 }
 
-export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
-  console.log("Processing batch of", event.Records.length, "messages");
+const lambdaHandler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
+  logger.info("Processing batch", { recordCount: event.Records.length });
 
   const batchItemFailures: SQSBatchItemFailure[] = [];
 
   for (const record of event.Records) {
+    const segment = tracer.getSegment();
+    const subsegment = segment?.addNewSubsegment("processRecord");
+
     try {
       await processMessage(record);
+      metrics.addMetric("MessageProcessed", MetricUnit.Count, 1);
     } catch (error) {
       if (error instanceof NonRetryableError) {
         // リトライ不要なエラー: ログを残してスキップ
-        console.error(
-          `Non-retryable error for ${record.messageId}:`,
-          error.message
-        );
+        logger.error("Non-retryable error", {
+          messageId: record.messageId,
+          error: error.message,
+        });
+        metrics.addMetric("NonRetryableError", MetricUnit.Count, 1);
         // メッセージを成功として扱い、DLQに行かないようにする
-        // 代わりに別の方法で記録（例: エラーテーブル）
         await logFailedMessage(record, error);
       } else {
         // リトライ可能なエラー: 失敗としてマーク
-        console.error(`Retryable error for ${record.messageId}:`, error);
+        logger.error("Retryable error", {
+          messageId: record.messageId,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+        metrics.addMetric("RetryableError", MetricUnit.Count, 1);
         batchItemFailures.push({ itemIdentifier: record.messageId });
       }
+    } finally {
+      subsegment?.close();
     }
   }
 
@@ -207,17 +258,25 @@ export const handler = async (event: SQSEvent): Promise<SQSBatchResponse> => {
 };
 
 async function processMessage(record: any): Promise<void> {
-  const message = JSON.parse(record.body);
-  const detail = message.detail;
+  // メッセージのバリデーション
+  const parseResult = EventBridgeMessageSchema.safeParse(
+    JSON.parse(record.body)
+  );
 
-  // バリデーション
-  if (!detail.orderId) {
-    throw new NonRetryableError("Missing orderId");
+  if (!parseResult.success) {
+    throw new NonRetryableError(
+      `Validation failed: ${parseResult.error.errors[0].message}`
+    );
   }
 
-  if (detail.totalAmount < 0) {
-    throw new NonRetryableError("Invalid amount");
-  }
+  const detail = parseResult.data.detail;
+
+  tracer.putAnnotation("orderId", detail.orderId);
+
+  logger.info("Processing payment", {
+    orderId: detail.orderId,
+    amount: detail.totalAmount,
+  });
 
   // 外部API呼び出し（リトライ可能なエラーの可能性）
   try {
@@ -231,8 +290,7 @@ async function processMessage(record: any): Promise<void> {
 }
 
 async function callPaymentApi(detail: any): Promise<void> {
-  // 実際の決済API呼び出し
-  // シミュレーション
+  // 実際の決済API呼び出し（シミュレーション）
   if (Math.random() < 0.1) {
     const error: any = new Error("Connection timeout");
     error.code = "TIMEOUT";
@@ -242,50 +300,83 @@ async function callPaymentApi(detail: any): Promise<void> {
 
 async function logFailedMessage(record: any, error: Error): Promise<void> {
   // 失敗したメッセージをログまたはDBに記録
-  console.log("Logging failed message:", {
+  logger.warn("Logging failed message for investigation", {
     messageId: record.messageId,
     error: error.message,
     body: record.body,
+    timestamp: new Date().toISOString(),
   });
 }
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
-### DLQ 処理 Lambda
+### DLQ 処理 Lambda（Lambda Powertools + Zod + Middy）
 
 ```typescript
 // lambda/dlq-processor/index.ts
 import { SQSEvent } from "aws-lambda";
+import { Logger } from "@aws-lambda-powertools/logger";
+import { Tracer } from "@aws-lambda-powertools/tracer";
+import { Metrics, MetricUnit } from "@aws-lambda-powertools/metrics";
+import middy from "@middy/core";
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
 import {
   SQSClient,
   SendMessageCommand,
   DeleteMessageCommand,
 } from "@aws-sdk/client-sqs";
+import { z } from "zod";
 
-const sqsClient = new SQSClient({
-  endpoint: process.env.LOCALSTACK_HOSTNAME
-    ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
-    : undefined,
+const logger = new Logger({ serviceName: "dlq-processor" });
+const tracer = new Tracer({ serviceName: "dlq-processor" });
+const metrics = new Metrics({
+  serviceName: "dlq-processor",
+  namespace: "OrderService",
 });
+
+const sqsClient = tracer.captureAWSv3Client(
+  new SQSClient({
+    endpoint: process.env.LOCALSTACK_HOSTNAME
+      ? `http://${process.env.LOCALSTACK_HOSTNAME}:4566`
+      : undefined,
+  })
+);
 
 const ORIGINAL_QUEUE_URL = process.env.ORIGINAL_QUEUE_URL!;
 
-interface DLQMessage {
-  originalMessage: any;
-  errorInfo: {
-    errorMessage: string;
-    failedAt: string;
-    retryCount: number;
-  };
+// Zod スキーマ
+const OrderDetailSchema = z.object({
+  orderId: z.string().optional(),
+  customerId: z.string().optional(),
+  totalAmount: z.number().optional(),
+});
+
+const DLQMessageSchema = z.object({
+  detail: OrderDetailSchema.optional(),
+});
+
+interface AnalysisResult {
+  canRetry: boolean;
+  reason: string;
 }
 
-export const handler = async (event: SQSEvent): Promise<void> => {
-  console.log("Processing DLQ messages:", event.Records.length);
+const lambdaHandler = async (event: SQSEvent): Promise<void> => {
+  logger.info("Processing DLQ messages", { recordCount: event.Records.length });
 
   for (const record of event.Records) {
+    const segment = tracer.getSegment();
+    const subsegment = segment?.addNewSubsegment("processDLQMessage");
+
     try {
       const message = JSON.parse(record.body);
 
-      console.log("Analyzing DLQ message:", {
+      logger.info("Analyzing DLQ message", {
         messageId: record.messageId,
         approximateReceiveCount: record.attributes.ApproximateReceiveCount,
       });
@@ -295,34 +386,49 @@ export const handler = async (event: SQSEvent): Promise<void> => {
 
       if (analysis.canRetry) {
         // 再処理可能な場合、元のキューに戻す
-        await requeueMessage(message, record.receiptHandle);
-        console.log(`Message ${record.messageId} requeued`);
+        await requeueMessage(message);
+        metrics.addMetric("MessageRequeued", MetricUnit.Count, 1);
+        logger.info("Message requeued", {
+          messageId: record.messageId,
+          reason: analysis.reason,
+        });
       } else {
         // 再処理不可能な場合、アーカイブまたは通知
         await archiveMessage(record, analysis.reason);
-        console.log(`Message ${record.messageId} archived: ${analysis.reason}`);
+        metrics.addMetric("MessageArchived", MetricUnit.Count, 1);
+        logger.warn("Message archived", {
+          messageId: record.messageId,
+          reason: analysis.reason,
+        });
       }
     } catch (error) {
-      console.error("Error processing DLQ message:", error);
+      logger.error("Error processing DLQ message", {
+        messageId: record.messageId,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    } finally {
+      subsegment?.close();
     }
   }
 };
 
-interface AnalysisResult {
-  canRetry: boolean;
-  reason: string;
-}
-
 function analyzeMessage(message: any): AnalysisResult {
-  // メッセージの内容を分析して再処理可能か判断
+  // Zod でバリデーション
+  const parseResult = DLQMessageSchema.safeParse(message);
 
-  // 例: 不正なデータ形式
-  if (!message.detail || !message.detail.orderId) {
+  if (!parseResult.success) {
     return { canRetry: false, reason: "Invalid message format" };
   }
 
-  // 例: ビジネスルール違反
-  if (message.detail.totalAmount < 0) {
+  const detail = parseResult.data.detail;
+
+  // 必須フィールドのチェック
+  if (!detail?.orderId) {
+    return { canRetry: false, reason: "Missing orderId" };
+  }
+
+  // ビジネスルール違反のチェック
+  if (detail.totalAmount !== undefined && detail.totalAmount < 0) {
     return { canRetry: false, reason: "Invalid amount" };
   }
 
@@ -330,11 +436,7 @@ function analyzeMessage(message: any): AnalysisResult {
   return { canRetry: true, reason: "Temporary failure" };
 }
 
-async function requeueMessage(
-  message: any,
-  receiptHandle: string
-): Promise<void> {
-  // 元のキューにメッセージを送信
+async function requeueMessage(message: any): Promise<void> {
   await sqsClient.send(
     new SendMessageCommand({
       QueueUrl: ORIGINAL_QUEUE_URL,
@@ -346,13 +448,18 @@ async function requeueMessage(
 
 async function archiveMessage(record: any, reason: string): Promise<void> {
   // アーカイブ処理（S3、DynamoDBなど）
-  console.log("Archiving message:", {
+  logger.info("Archiving message", {
     messageId: record.messageId,
     reason,
     body: record.body,
     timestamp: new Date().toISOString(),
   });
 }
+
+export const handler = middy(lambdaHandler)
+  .use(injectLambdaContext(logger, { logEvent: true }))
+  .use(captureLambdaHandler(tracer))
+  .use(logMetrics(metrics, { captureColdStartMetric: true }));
 ```
 
 ---
