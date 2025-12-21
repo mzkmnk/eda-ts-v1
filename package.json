@@ -6,7 +6,13 @@
     "build": "tsc",
     "watch": "tsc -w",
     "test": "jest",
-    "cdk": "cdk"
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "deploy:local": "cdk deploy",
+    "localstack:up":"docker compose up -d",
+    "localstack:down": "docker compose down",
+    "localstack:logs": "docker compose logs -f"
   },
   "keywords": [],
   "author": "",
