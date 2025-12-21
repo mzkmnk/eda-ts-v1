@@ -1,0 +1,48 @@
+{
+  "name": "eda-ts-v1",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "deploy:local": "cdk deploy",
+    "localstack:up":"docker compose up -d",
+    "localstack:down": "docker compose down",
+    "localstack:logs": "docker compose logs -f"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.11.0",
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.159",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^25.0.3",
+    "aws-cdk": "^2.1100.1",
+    "aws-cdk-lib": "^2.233.0",
+    "aws-cdk-local": "^3.0.1",
+    "constructs": "^10.4.4",
+    "esbuild": "^0.27.2",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@aws-lambda-powertools/idempotency": "^2.30.0",
+    "@aws-lambda-powertools/logger": "^2.30.0",
+    "@aws-lambda-powertools/metrics": "^2.30.0",
+    "@aws-lambda-powertools/tracer": "^2.30.0",
+    "@aws-sdk/client-dynamodb": "^3.956.0",
+    "@aws-sdk/client-eventbridge": "^3.956.0",
+    "@aws-sdk/client-sns": "^3.956.0",
+    "@aws-sdk/client-sqs": "^3.956.0",
+    "@aws-sdk/lib-dynamodb": "^3.956.0",
+    "@middy/core": "^6.4.5",
+    "zod": "^4.2.1"
+  }
+}
