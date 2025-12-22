@@ -9,3 +9,5 @@ cdk.out
 
 # LocalStack data
 localstack-data
+
+.DS_Store
