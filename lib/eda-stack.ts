@@ -26,7 +26,7 @@ export class EdaStack extends cdk.Stack {
       }
     );
 
-    const orderProcessor = new nodejs.NodejsFunction(this, "OrderProcesser", {
+    const orderProcessor = new nodejs.NodejsFunction(this, "OrderProcessor", {
       entry: path.join(__dirname, "../src/lambda/order-processor/index.ts"),
       handler: "handler",
       runtime: lambda.Runtime.NODEJS_22_X,
