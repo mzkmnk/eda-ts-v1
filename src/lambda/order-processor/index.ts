@@ -20,7 +20,7 @@ const logger = new Logger();
 const tracer = new Tracer();
 const metrics = new Metrics();
 
-const lambdaHandlder = async (
+const lambdaHandler = async (
   event: EventBridgeEvent<"OrderCreated", OrderDetail>
 ) => {
   const parseResult = OrderDetailSchema.safeParse(event.detail);
@@ -52,7 +52,7 @@ const lambdaHandlder = async (
   logger.info("Processing completed", { orderId });
 };
 
-export const handler = middy(lambdaHandlder)
+export const handler = middy(lambdaHandler)
   .use(injectLambdaContext(logger, { logEvent: true }))
   .use(captureLambdaHandler(tracer))
   .use(logMetrics(metrics, { captureColdStartMetric: true }));
