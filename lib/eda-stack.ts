@@ -17,6 +17,15 @@ export class EdaStack extends cdk.Stack {
       eventBusName: "order-events",
     });
 
+    const orderProcessorLambdaDLQ = new sqs.Queue(
+      this,
+      "OrderProcessorLambdaDLQ",
+      {
+        queueName: "order-processor-lambda-dlq",
+        retentionPeriod: cdk.Duration.days(14),
+      }
+    );
+
     const orderProcesser = new nodejs.NodejsFunction(this, "OrderProcesser", {
       entry: path.join(__dirname, "../src/lambda/order-processor/index.ts"),
       handler: "handler",
@@ -24,6 +33,8 @@ export class EdaStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       tracing: lambda.Tracing.ACTIVE,
+      deadLetterQueue: orderProcessorLambdaDLQ,
+      retryAttempts: 2,
       environment: {
         POWERTOOLS_SERVICE_NAME: "order-processor",
         POWERTOOLS_METRICS_NAMESPACE: "OrderService",
@@ -46,12 +57,17 @@ export class EdaStack extends cdk.Stack {
       },
     });
 
-    const orderProcessorDLQ = new sqs.Queue(this, "OrderProcessorDLQ", {
+    const orderProcessorEventDLQ = new sqs.Queue(this, "OrderProcessorDLQ", {
       queueName: "order-processor-dlq",
-      retentionPeriod: cdk.Duration.days(14)
-    })
+      retentionPeriod: cdk.Duration.days(14),
+    });
 
-    orderCreatedRule.addTarget(new targets.LambdaFunction(orderProcesser,{deadLetterQueue:orderProcessorDLQ,retryAttempts:2,maxEventAge: cdk.Duration.hours(1)}));
-
+    orderCreatedRule.addTarget(
+      new targets.LambdaFunction(orderProcesser, {
+        deadLetterQueue: orderProcessorEventDLQ,
+        retryAttempts: 2,
+        maxEventAge: cdk.Duration.hours(1),
+      })
+    );
   }
 }
