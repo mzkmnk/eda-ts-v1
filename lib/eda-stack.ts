@@ -4,6 +4,7 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import path from "path";
 
 const __dirname = import.meta.dirname;
@@ -14,11 +15,6 @@ export class EdaStack extends cdk.Stack {
 
     const eventBus = new events.EventBus(this, "orderEventsBus", {
       eventBusName: "order-events",
-    });
-
-    new cdk.CfnOutput(this, "EventBusArn", {
-      value: eventBus.eventBusArn,
-      description: "Order Event Bus Arn",
     });
 
     const orderProcesser = new nodejs.NodejsFunction(this, "OrderProcesser", {
@@ -50,6 +46,12 @@ export class EdaStack extends cdk.Stack {
       },
     });
 
-    orderCreatedRule.addTarget(new targets.LambdaFunction(orderProcesser));
+    const orderProcessorDLQ = new sqs.Queue(this, "OrderProcessorDLQ", {
+      queueName: "order-processor-dlq",
+      retentionPeriod: cdk.Duration.days(14)
+    })
+
+    orderCreatedRule.addTarget(new targets.LambdaFunction(orderProcesser,{deadLetterQueue:orderProcessorDLQ,retryAttempts:2,maxEventAge: cdk.Duration.hours(1)}));
+
   }
 }
