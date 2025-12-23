@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from "aws-cdk-lib";
-import { EdaStack } from "../lib/eda-stack";
+import { EdaStack } from "../lib/eda-stack.js";
 
 const app = new cdk.App();
 new EdaStack(app, "EdaStack", {
