@@ -39,7 +39,6 @@ export class EdaStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: "order-processor",
         POWERTOOLS_METRICS_NAMESPACE: "OrderService",
         LOG_LEVEL: "INFO",
-        EVENT_BUS_NAME: eventBus.eventBusName,
       },
       bundling: {
         minify: true,
