@@ -26,7 +26,7 @@ export class EdaStack extends cdk.Stack {
       }
     );
 
-    const orderProcesser = new nodejs.NodejsFunction(this, "OrderProcesser", {
+    const orderProcessor = new nodejs.NodejsFunction(this, "OrderProcesser", {
       entry: path.join(__dirname, "../src/lambda/order-processor/index.ts"),
       handler: "handler",
       runtime: lambda.Runtime.NODEJS_22_X,
@@ -63,7 +63,7 @@ export class EdaStack extends cdk.Stack {
     });
 
     orderCreatedRule.addTarget(
-      new targets.LambdaFunction(orderProcesser, {
+      new targets.LambdaFunction(orderProcessor, {
         deadLetterQueue: orderProcessorEventDLQ,
         retryAttempts: 2,
         maxEventAge: cdk.Duration.hours(1),
