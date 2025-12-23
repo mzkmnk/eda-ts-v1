@@ -17,12 +17,9 @@ const OrderDetailSchema = z.object({
 
 type OrderDetail = z.infer<typeof OrderDetailSchema>;
 
-const logger = new Logger({ serviceName: "order-processor" });
-const tracer = new Tracer({ serviceName: "order-processor" });
-const metrics = new Metrics({
-  serviceName: "order-processor",
-  namespace: "OrderService",
-});
+const logger = new Logger();
+const tracer = new Tracer();
+const metrics = new Metrics();
 
 const lambdaHandlder = async (
   event: EventBridgeEvent<"OrderCreated", OrderDetail>
