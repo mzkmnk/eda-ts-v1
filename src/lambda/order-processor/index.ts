@@ -7,7 +7,6 @@ import middy from "@middy/core";
 import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
 import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
 import { logMetrics } from "@aws-lambda-powertools/metrics/middleware";
-import { trace } from "console";
 
 const OrderDetailSchema = z.object({
   orderId: z.string().min(1),
@@ -38,7 +37,7 @@ const lambdaHandlder = async (
   tracer.putAnnotation("orderId", orderId);
   tracer.putAnnotation("customerId", customerId);
 
-  logger.info("order details", {
+  logger.info("Order details", {
     eventId: event.id,
     source: event.source,
     detailType: event["detail-type"],
@@ -51,11 +50,6 @@ const lambdaHandlder = async (
   metrics.addMetadata("orderId", orderId);
 
   logger.info("Processing completed", { orderId });
-
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ message: `Order ${orderId} processed` }),
-  };
 };
 
 export const handler = middy(lambdaHandlder)
